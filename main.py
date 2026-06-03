@@ -12,7 +12,9 @@ from discord.ext import tasks
 # ─────────────────────────────────────────────
 TOKEN    = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
-LIVE_LIST_CHANNEL_ID = 1511774093949669417
+LIVE_LIST_CHANNEL_ID  = 1511774093949669417
+TICKET_PANEL_CHANNEL_ID = 1511791311592882247   # channel where the panel is posted
+TICKET_CATEGORY_ID      = 1511791695245738156   # category where ticket channels are created
 
 # ─────────────────────────────────────────────
 #  IN-MEMORY STORES
@@ -21,6 +23,8 @@ warnings_store: dict[str, list[dict]] = {}
 warn_counter: list[int] = [0]
 muendliche_counts: dict[str, int] = {}
 live_message_id: Optional[int] = None
+ticket_counter: list[int] = [0]
+open_tickets: dict[str, int] = {}  # user_id -> channel_id
 
 # ─────────────────────────────────────────────
 #  ROLE NAME CONSTANTS
@@ -37,6 +41,20 @@ DURATION_ORDER = (
     + [f"{i} Tage" for i in range(2, 31)]
     + ["1 Monat"]
 )
+
+# ─────────────────────────────────────────────
+#  TICKET CONSTANTS
+# ─────────────────────────────────────────────
+LOGO_PATH            = "attached_assets/ChatGPT_Image_Jun_3,_2026,_03_52_38_PM_1780509463635.png"
+TICKET_CATEGORY_NAME = "📩 Tickets"
+
+TICKET_TYPES: dict[str, tuple[str, str, str, discord.ButtonStyle]] = {
+    "support":    ("🎧", "Support",          "Allgemeiner Support & Hilfe",               discord.ButtonStyle.primary),
+    "kasko":      ("🚗", "Kasko Beantragen", "Kaskoversicherung beantragen",              discord.ButtonStyle.success),
+    "beschwerde": ("📋", "Beschwerde",       "Beschwerde einreichen",                     discord.ButtonStyle.danger),
+    "svg":        ("🛡️", "SVG-Antrag",      "SVG Versicherung beantragen",              discord.ButtonStyle.success),
+    "lvv":        ("💚", "LVV-Antrag",      "LVV Lebensversicherung beantragen",         discord.ButtonStyle.success),
+}
 
 # ─────────────────────────────────────────────
 #  COLORS
@@ -1140,6 +1158,269 @@ async def cmd_notiz(interaction: discord.Interaction,
         ), ephemeral=True)
 
 # ─────────────────────────────────────────────
+#  TICKET SYSTEM — VIEWS & HELPERS
+# ─────────────────────────────────────────────
+def get_logo_file() -> discord.File:
+    return discord.File(LOGO_PATH, filename="logo.png")
+
+def make_ticket_embed(title: str, description: str,
+                      fields: Optional[list[dict]] = None,
+                      color: int = INSURANCE_COLOR,
+                      with_logo: bool = False) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description,
+                          color=color, timestamp=datetime.now(timezone.utc))
+    if with_logo:
+        embed.set_image(url="attachment://logo.png")
+    for f in (fields or []):
+        embed.add_field(name=f["name"], value=f["value"], inline=f.get("inline", False))
+    embed.set_footer(text="LVM Versicherung  ·  Sicher. Vertraut. LVM.  ·  Seit 1896")
+    return embed
+
+class TicketButton(discord.ui.Button):
+    def __init__(self, key: str, row: int):
+        emoji, label, _, style = TICKET_TYPES[key]
+        super().__init__(label=label, emoji=emoji, style=style,
+                         custom_id=f"ticket_open_{key}", row=row)
+        self.key = key
+
+    async def callback(self, interaction: discord.Interaction):
+        await _open_ticket(interaction, self.key)
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        row_map = {"support": 0, "kasko": 0, "beschwerde": 0, "svg": 1, "lvv": 1}
+        for key, row in row_map.items():
+            self.add_item(TicketButton(key, row))
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 Ticket schließen", style=discord.ButtonStyle.danger,
+                       custom_id="ticket_close_btn")
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        confirm_view = discord.ui.View(timeout=30)
+
+        async def do_close(ci: discord.Interaction):
+            await ci.response.defer()
+            ch = ci.channel
+            uid = next((k for k, v in open_tickets.items() if v == ch.id), None)
+            if uid:
+                del open_tickets[uid]
+            close_embed = discord.Embed(
+                title="🔒 Ticket wird geschlossen",
+                description=(
+                    f"Geschlossen von {ci.user.mention}\n"
+                    f"Dieser Kanal wird in **5 Sekunden** gelöscht."
+                ),
+                color=C_RED, timestamp=datetime.now(timezone.utc)
+            )
+            close_embed.set_footer(text="LVM Versicherung | Ticket-System")
+            await ch.send(embed=close_embed)
+            await asyncio.sleep(5)
+            try:
+                await ch.delete(reason=f"Ticket geschlossen von {ci.user}")
+            except Exception:
+                pass
+
+        async def do_cancel(ci: discord.Interaction):
+            await ci.response.edit_message(
+                embed=make_embed(C_GREEN, "✅ Abgebrochen", "Das Ticket bleibt offen."),
+                view=None)
+
+        yes_btn = discord.ui.Button(label="✅ Ja, schließen", style=discord.ButtonStyle.danger)
+        no_btn  = discord.ui.Button(label="❌ Abbrechen",    style=discord.ButtonStyle.secondary)
+        yes_btn.callback = do_close
+        no_btn.callback  = do_cancel
+        confirm_view.add_item(yes_btn)
+        confirm_view.add_item(no_btn)
+
+        await interaction.response.send_message(
+            embed=make_embed(C_YELLOW, "⚠️ Ticket schließen?",
+                             "Möchtest du dieses Ticket wirklich schließen?\n"
+                             "Der Kanal wird dauerhaft gelöscht."),
+            view=confirm_view, ephemeral=True)
+
+async def _open_ticket(interaction: discord.Interaction, key: str):
+    uid = str(interaction.user.id)
+
+    # Block duplicate tickets
+    if uid in open_tickets:
+        existing = interaction.guild.get_channel(open_tickets[uid])
+        if existing:
+            return await interaction.response.send_message(
+                embed=make_embed(C_YELLOW, "⚠️ Ticket bereits offen",
+                                 f"Du hast bereits ein offenes Ticket: {existing.mention}"),
+                ephemeral=True)
+        del open_tickets[uid]
+
+    await interaction.response.defer(ephemeral=True)
+
+    emoji, label, desc, _ = TICKET_TYPES[key]
+
+    # Use the specific ticket category by ID
+    category = interaction.guild.get_channel(TICKET_CATEGORY_ID)
+
+    ticket_counter[0] += 1
+    num = ticket_counter[0]
+
+    safe_name = "".join(c for c in interaction.user.display_name.lower()
+                        if c.isalnum() or c == "-")[:14] or "user"
+    # Channel name includes emoji + ticket type name e.g. 🎧〡support-username-0001
+    ch_name = f"{emoji}〡{key}-{safe_name}-{num:04d}"
+
+    # Permissions: deny everyone, allow user + any role with manage_roles
+    overwrites: dict = {
+        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user:               discord.PermissionOverwrite(view_channel=True,
+                                                                     send_messages=True,
+                                                                     attach_files=True,
+                                                                     read_message_history=True),
+        interaction.guild.me:           discord.PermissionOverwrite(view_channel=True,
+                                                                     send_messages=True,
+                                                                     manage_channels=True,
+                                                                     read_message_history=True),
+    }
+    for role in interaction.guild.roles:
+        if role.permissions.manage_roles and role != interaction.guild.default_role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True,
+                                                           send_messages=True,
+                                                           read_message_history=True)
+
+    channel = await interaction.guild.create_text_channel(
+        name=ch_name, category=category, overwrites=overwrites,
+        topic=f"Ticket #{num:04d} | {label} | {interaction.user} ({interaction.user.id})")
+
+    open_tickets[uid] = channel.id
+
+    # Welcome embed with logo banner
+    welcome = make_ticket_embed(
+        title=f"{emoji} {label}  —  Ticket #{num:04d}",
+        description=(
+            f"Willkommen, {interaction.user.mention}! 👋\n\n"
+            f"**{desc}**\n\n"
+            f"Bitte schildere dein Anliegen so **detailliert** wie möglich.\n"
+            f"Ein Mitarbeiter wird sich in Kürze bei dir melden.\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        fields=[
+            {"name": "👤 Ersteller",   "value": interaction.user.mention,                       "inline": True},
+            {"name": "📋 Kategorie",   "value": f"{emoji} {label}",                             "inline": True},
+            {"name": "🎫 Ticket-Nr.",  "value": f"`#{num:04d}`",                                 "inline": True},
+            {"name": "📅 Erstellt",    "value": f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>",
+             "inline": True},
+        ],
+        with_logo=True
+    )
+
+    await channel.send(
+        content=f"{interaction.user.mention}",
+        embeds=[welcome],
+        file=get_logo_file(),
+        view=TicketCloseView()
+    )
+
+    await interaction.followup.send(
+        embed=make_embed(C_GREEN, "✅ Ticket erstellt",
+                         f"Dein Ticket wurde erstellt: {channel.mention}"),
+        ephemeral=True)
+
+# ─────────────────────────────────────────────
+#  /ticket_setup
+# ─────────────────────────────────────────────
+@tree.command(guild=GUILD, name="ticket_setup",
+              description="Sendet das Ticket-Panel in den konfigurierten Kanal (Admin only)")
+async def cmd_ticket_setup(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(embed=make_embed(
+            C_RED, "❌ Keine Berechtigung"), ephemeral=True)
+
+    target = interaction.guild.get_channel(TICKET_PANEL_CHANNEL_ID)
+    if not target or not isinstance(target, discord.TextChannel):
+        return await interaction.response.send_message(embed=make_embed(
+            C_RED, "❌ Panel-Kanal nicht gefunden",
+            f"Kanal `{TICKET_PANEL_CHANNEL_ID}` wurde nicht gefunden."), ephemeral=True)
+
+    await interaction.response.send_message(
+        embed=make_embed(C_CYAN, "⏳ Panel wird erstellt…"), ephemeral=True)
+
+    # ── Header embed (with logo banner) ──────────────────────────────────
+    header = make_ticket_embed(
+        title="🏢  LVM Versicherung  |  Support-Center",
+        description=(
+            "```\n"
+            "  SICHER. VERTRAUT. LVM.\n"
+            "  IN GUTEN HÄNDEN. SEIT 1896.\n"
+            "```\n"
+            "Willkommen in unserem **Ticket-System**.\n"
+            "Wähle unten eine Kategorie aus, um ein Ticket zu eröffnen.\n"
+            "Unser Team kümmert sich schnellstmöglich um dein Anliegen.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        with_logo=True
+    )
+
+    # ── Categories embed ─────────────────────────────────────────────────
+    cats = discord.Embed(title="📋  Verfügbare Kategorien", color=INSURANCE_COLOR)
+    cats.set_footer(text="LVM Versicherung  ·  Sicher. Vertraut. LVM.  ·  Seit 1896")
+    row_labels = {
+        "support":    "Allgemeiner Support & technische Hilfe",
+        "kasko":      "Kaskoversicherung beantragen oder verlängern",
+        "beschwerde": "Beschwerde über Mitarbeiter oder Vorgänge",
+        "svg":        "SVG-Schadensversicherung beantragen",
+        "lvv":        "LVV-Lebensversicherung beantragen",
+    }
+    for key, text in row_labels.items():
+        emoji, label, _, _ = TICKET_TYPES[key]
+        cats.add_field(name=f"{emoji}  {label}", value=f"> {text}", inline=False)
+
+    logo_file = get_logo_file()
+    await target.send(embeds=[header, cats], file=logo_file, view=TicketPanelView())
+    await interaction.edit_original_response(
+        embed=make_embed(C_GREEN, "✅ Panel erstellt!",
+                         f"Das Ticket-Panel wurde in {target.mention} gesendet."))
+
+# ─────────────────────────────────────────────
+#  /ticket_hinzufügen
+# ─────────────────────────────────────────────
+@tree.command(guild=GUILD, name="ticket_hinzufügen",
+              description="Fügt ein Mitglied zum aktuellen Ticket hinzu")
+@app_commands.describe(mitglied="Das Mitglied")
+async def cmd_ticket_hinzufuegen(interaction: discord.Interaction, mitglied: discord.Member):
+    if not interaction.user.guild_permissions.manage_channels:
+        return await interaction.response.send_message(embed=make_embed(
+            C_RED, "❌ Keine Berechtigung"), ephemeral=True)
+    await interaction.channel.set_permissions(
+        mitglied, view_channel=True, send_messages=True, read_message_history=True)
+    await interaction.response.send_message(embed=make_embed(
+        C_GREEN, "✅ Mitglied hinzugefügt",
+        fields=[
+            {"name": "👤 Mitglied", "value": mitglied.mention,           "inline": True},
+            {"name": "📩 Kanal",    "value": interaction.channel.mention, "inline": True},
+            {"name": "👮 Von",      "value": interaction.user.mention,    "inline": True},
+        ]))
+
+# ─────────────────────────────────────────────
+#  /ticket_entfernen
+# ─────────────────────────────────────────────
+@tree.command(guild=GUILD, name="ticket_entfernen",
+              description="Entfernt ein Mitglied aus dem aktuellen Ticket")
+@app_commands.describe(mitglied="Das Mitglied")
+async def cmd_ticket_entfernen(interaction: discord.Interaction, mitglied: discord.Member):
+    if not interaction.user.guild_permissions.manage_channels:
+        return await interaction.response.send_message(embed=make_embed(
+            C_RED, "❌ Keine Berechtigung"), ephemeral=True)
+    await interaction.channel.set_permissions(mitglied, overwrite=None)
+    await interaction.response.send_message(embed=make_embed(
+        C_RED, "🚫 Mitglied entfernt",
+        fields=[
+            {"name": "👤 Mitglied", "value": mitglied.mention,           "inline": True},
+            {"name": "📩 Kanal",    "value": interaction.channel.mention, "inline": True},
+            {"name": "👮 Von",      "value": interaction.user.mention,    "inline": True},
+        ]))
+
+# ─────────────────────────────────────────────
 #  LIVE LIST LOGIC
 # ─────────────────────────────────────────────
 def _duration_sort_key(role_name: str, prefix: str) -> int:
@@ -1290,6 +1571,10 @@ async def before_live_list():
 # ─────────────────────────────────────────────
 @bot.event
 async def on_ready():
+    # Register persistent views so buttons survive restarts
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketCloseView())
+
     await tree.sync(guild=GUILD)
     print(f"✅ Bot ist bereit: {bot.user} | Guilds: {len(bot.guilds)}", flush=True)
     print(f"✅ Slash-Commands synchronisiert für Guild {GUILD_ID}", flush=True)
